@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 from __future__ import annotations
 
 import collections
@@ -39,7 +40,7 @@ from cosmos_predict2._src.imaginaire.lazy_config import LazyDict
 from cosmos_predict2._src.imaginaire.lazy_config import instantiate as lazy_instantiate
 from cosmos_predict2._src.imaginaire.model import ImaginaireModel
 from cosmos_predict2._src.imaginaire.utils import log, misc
-from cosmos_predict2._src.imaginaire.utils.checkpointer import non_strict_load_model
+# Removed non_strict_load_model import - using strict mode only for checkpoint loading
 from cosmos_predict2._src.imaginaire.utils.context_parallel import (
     broadcast,
     broadcast_split_tensor,
@@ -113,6 +114,9 @@ class Text2WorldModelRectifiedFlowConfig:
     high_sigma_timesteps_max: int = 1000
 
     use_kerras_sigma_at_inference: bool = False  # if True, override unipc's timestep schedule with kerras schedule
+    
+    # Kinematic prediction settings
+    kinematic_loss_weight: float = 0.0  # Weight for kinematic loss (0 = disabled)
 
     def __attrs_post_init__(self):
         assert self.text_encoder_class in ["T5", "umT5", "reason1_2B", "reason1_7B", "reason1p1_7B"]
@@ -260,6 +264,16 @@ class Text2WorldModelRectifiedFlow(ImaginaireModel):
             )
             self.net = self.build_net()
             self._param_count = count_params(self.net, verbose=False)
+            
+            # Conditionally initialize kinematic modules only if kinematic_loss_weight > 0
+            # This ensures original Cosmos checkpoints (without kinematic modules) can be loaded cleanly
+            kinematic_loss_weight = getattr(config, 'kinematic_loss_weight', 0.0)
+            if kinematic_loss_weight > 0:
+                print(f"[Kinematic Setup] kinematic_loss_weight={kinematic_loss_weight} > 0, initializing kinematic modules")
+                self._setup_kinematic_modules()
+            else:
+                print(f"[Kinematic Setup] kinematic_loss_weight={kinematic_loss_weight}, skipping kinematic module initialization")
+                print(f"[Kinematic Setup] Original Cosmos checkpoint mode - kinematic modules will not be created")
 
             if config.ema.enabled:
                 # Keep EMA on CPU initially to avoid OOM during model loading from consolidated checkpoint
@@ -280,6 +294,60 @@ class Text2WorldModelRectifiedFlow(ImaginaireModel):
                 if not keep_on_cpu:
                     self.net_ema_worker.copy_to(src_model=self.net, tgt_model=self.net_ema)
         torch.cuda.empty_cache()
+    
+    def _setup_kinematic_modules(self):
+        """Setup kinematic conditioning and prediction modules."""
+        import torch
+        import torch.nn as nn
+        from cosmos_predict2._src.predict2.networks.kinematic_conditioner import KinematicConditioner
+        from cosmos_predict2._src.predict2.networks.detr_kinematic_head import DETRKinematicHead
+        
+        # Get the actual model (unwrap LoRA if present)
+        actual_model = self.net
+        if hasattr(self.net, 'get_base_model'):
+            # LoRA/PEFT is wrapping the model
+            actual_model = self.net.get_base_model()
+            print(f"[Kinematic Setup] Detected LoRA wrapper, accessing base model")
+        
+        model_channels = actual_model.model_channels
+        
+        print(f"[Kinematic Setup] Initializing kinematic modules with model_channels={model_channels}")
+        
+        # Create kin_scale parameter (only if not already created)
+        if actual_model.kin_scale is None:
+            device = next(actual_model.parameters()).device if list(actual_model.parameters()) else torch.device("cpu")
+            actual_model.kin_scale = nn.Parameter(torch.zeros(1, device=device))
+            print(f"[Kinematic Setup] ✓ Created kin_scale parameter")
+        
+        # Create and attach kinematic conditioner to the actual base model
+        actual_model.kinematic_conditioner = KinematicConditioner(
+            model_channels=model_channels,
+            kinematic_dim=18,  # (x,y,z,vx,vy,vz,ax,ay,az,l,w,h,yaw,tracking_id) + 4 classes
+            max_agents=32,
+            sigma=0.1,
+        )
+        print(f"[Kinematic Setup] ✓ KinematicConditioner initialized")
+        
+        # Create and attach DETR kinematic prediction head to the actual base model
+        actual_model.kinematic_head = DETRKinematicHead(
+            model_channels=model_channels,
+            num_agents=32,
+            num_decoder_layers=3,
+            num_heads=8,
+            dim_feedforward=2048,
+            max_frames=100,
+        )
+        print(f"[Kinematic Setup] ✓ DETRKinematicHead initialized")
+        
+        # Move modules to the same device as the model
+        device = actual_model.kin_scale.device
+        actual_model.kinematic_conditioner = actual_model.kinematic_conditioner.to(device)
+        actual_model.kinematic_head = actual_model.kinematic_head.to(device)
+        print(f"[Kinematic Setup] ✓ Moved kinematic modules to device: {device}")
+        
+        print(f"[Kinematic Setup] ✓ Kinematic integration complete!")
+        print(f"[Kinematic Setup]   - kin_scale: {actual_model.kin_scale.item():.6f}")
+        print(f"[Kinematic Setup]   - kinematic_loss_weight: {self.config.kinematic_loss_weight}")
 
     def apply_fsdp(self, dp_mesh: DeviceMesh) -> None:
         """Apply FSDP to the net and net_ema."""
@@ -359,6 +427,56 @@ class Text2WorldModelRectifiedFlow(ImaginaireModel):
 
     # ------------------------ training ------------------------
 
+    def _check_gradients(self, iteration: int):
+        """Check and print gradient status for kinematic and LoRA parameters."""
+        if iteration % 100 != 0:  # Only check every 100 iterations
+            return
+        
+        # Get actual model (unwrap LoRA if present)
+        actual_model = self.net
+        is_lora = hasattr(self.net, 'get_base_model')
+        if is_lora:
+            actual_model = self.net.get_base_model()
+        
+        # Check kinematic parameters
+        kin_cond_params = list(actual_model.kinematic_conditioner.parameters()) if hasattr(actual_model, 'kinematic_conditioner') else []
+        kin_head_params = list(actual_model.kinematic_head.parameters()) if hasattr(actual_model, 'kinematic_head') else []
+        
+        # Check LoRA parameters
+        lora_params = []
+        if is_lora:
+            lora_params = [p for name, p in self.net.named_parameters() if 'lora' in name.lower() and p.requires_grad]
+        
+        # Print requires_grad status
+        kin_cond_trainable = sum(1 for p in kin_cond_params if p.requires_grad)
+        kin_head_trainable = sum(1 for p in kin_head_params if p.requires_grad)
+        lora_trainable = len(lora_params)
+        
+        print(f"[Grad Check] iter={iteration} | "
+              f"kin_cond: {kin_cond_trainable}/{len(kin_cond_params)} trainable | "
+              f"kin_head: {kin_head_trainable}/{len(kin_head_params)} trainable | "
+              f"lora: {lora_trainable} trainable")
+        
+        # Print gradient info if available
+        kin_cond_grads = [p.grad for p in kin_cond_params if p.grad is not None]
+        kin_head_grads = [p.grad for p in kin_head_params if p.grad is not None]
+        lora_grads = [p.grad for p in lora_params if p.grad is not None]
+        
+        #if kin_cond_grads or kin_head_grads or lora_grads:
+        kin_cond_grad_size = sum(g.numel() for g in kin_cond_grads)
+        kin_head_grad_size = sum(g.numel() for g in kin_head_grads)
+        lora_grad_size = sum(g.numel() for g in lora_grads)
+        
+        # Compute gradient magnitudes (L2 norm)
+        kin_cond_grad_norm = sum(g.norm().item() ** 2 for g in kin_cond_grads) ** 0.5 if kin_cond_grads else 0.0
+        kin_head_grad_norm = sum(g.norm().item() ** 2 for g in kin_head_grads) ** 0.5 if kin_head_grads else 0.0
+        lora_grad_norm = sum(g.norm().item() ** 2 for g in lora_grads) ** 0.5 if lora_grads else 0.0
+        
+        print(f"[Grad Check] iter={iteration} | "
+                f"kin_cond_grad: {kin_cond_grad_size:,} (norm: {kin_cond_grad_norm:.6f}) | "
+                f"kin_head_grad: {kin_head_grad_size:,} (norm: {kin_head_grad_norm:.6f}) | "
+                f"lora_grad: {lora_grad_size:,} (norm: {lora_grad_norm:.6f})")
+
     def training_step(
         self, data_batch: dict[str, torch.Tensor], iteration: int
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
@@ -389,7 +507,13 @@ class Text2WorldModelRectifiedFlow(ImaginaireModel):
             - The method also supports Kendall's loss
         """
         self._update_train_stats(data_batch)
-        return self.forward(data_batch)
+        output_batch, loss = self.forward(data_batch)
+        # Remove gradient check from here - gradients aren't computed yet!
+        return output_batch, loss
+
+    def on_after_backward(self, iteration: int = 0):
+        """Called after backward pass - gradients are now available."""
+        self._check_gradients(iteration)
 
     @staticmethod
     def get_context_parallel_group():
@@ -509,8 +633,9 @@ class Text2WorldModelRectifiedFlow(ImaginaireModel):
         is_negative_prompt: bool = False,
         num_steps: int = 35,
         shift: float = 5.0,
+        kinematics: Optional[torch.Tensor] = None,
         **kwargs,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, dict | None]:
         """
         Generate samples from the batch. Based on given batch, it will automatically determine whether to generate image or video samples.
         Args:
@@ -557,7 +682,16 @@ class Text2WorldModelRectifiedFlow(ImaginaireModel):
 
         timesteps = self.sample_scheduler.timesteps
 
-        velocity_fn = self.get_velocity_fn_from_batch(data_batch, guidance, is_negative_prompt=is_negative_prompt)
+        # Extract kinematics from data_batch if not provided directly
+        if kinematics is None:
+            kinematics = data_batch.get("kinematics", None)
+        
+        velocity_fn = self.get_velocity_fn_from_batch(
+            data_batch, 
+            guidance, 
+            is_negative_prompt=is_negative_prompt,
+            kinematics=kinematics,
+        )
         use_spatial_split = False
         if self.net.is_context_parallel_enabled:
             cp_size = len(torch.distributed.get_process_group_ranks(self.get_context_parallel_group()))
@@ -600,7 +734,12 @@ class Text2WorldModelRectifiedFlow(ImaginaireModel):
             if use_spatial_split:
                 latents = rearrange(latents, "b c (t h w) -> b c t h w", t=state_shape[1], h=state_shape[2])
 
-        return latents
+        # Extract kinematic predictions from velocity function if available
+        kinematic_predictions = None
+        if hasattr(velocity_fn, 'kinematic_predictions_store'):
+            kinematic_predictions = velocity_fn.kinematic_predictions_store.get("value")
+
+        return latents, kinematic_predictions
 
     @torch.no_grad()
     def generate_samples_from_batch_lora(
@@ -616,8 +755,9 @@ class Text2WorldModelRectifiedFlow(ImaginaireModel):
         disable_lora_at_low_t: bool = False,
         lora_disable_threshold_step: int = 900,
         adapter_switch_timesteps: list[int] = [],
+        kinematics: Optional[torch.Tensor] = None,
         **kwargs,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, dict | None]:
         """
         Generate samples from the batch. Based on given batch, it will automatically determine whether to generate image or video samples.
         Args:
@@ -731,7 +871,12 @@ class Text2WorldModelRectifiedFlow(ImaginaireModel):
             if use_spatial_split:
                 latents = rearrange(latents, "b c (t h w) -> b c t h w", t=state_shape[1], h=state_shape[2])
 
-        return latents
+        # Extract kinematic predictions from velocity function if available
+        kinematic_predictions = None
+        if hasattr(velocity_fn, 'kinematic_predictions_store'):
+            kinematic_predictions = velocity_fn.kinematic_predictions_store.get("value")
+
+        return latents, kinematic_predictions
 
     # ------------------------ Sampling ------------------------
     @torch.no_grad()
@@ -888,29 +1033,227 @@ class Text2WorldModelRectifiedFlow(ImaginaireModel):
         sigmas = rearrange(sigmas, "b -> b 1")
         xt_B_C_T_H_W, vt_B_C_T_H_W = self.rectified_flow.get_interpolation(epsilon_B_C_T_H_W, x0_B_C_T_H_W, sigmas)
 
-        vt_pred_B_C_T_H_W = self.denoise(
+
+        # Extract kinematics from data_batch (optional - required during training, optional during inference)
+        kinematics = data_batch.get("kinematics", None)
+        
+        denoise_output = self.denoise(
             noise=epsilon_B_C_T_H_W,
             xt_B_C_T_H_W=xt_B_C_T_H_W.to(**self.tensor_kwargs),
             timesteps_B_T=timesteps,
             condition=condition,
+            kinematics=kinematics,
         )
+        
+        # Unpack denoise output (always returns video + kinematic predictions)
+        # kinematic_predictions may be None if model doesn't have kinematic_head (original Cosmos checkpoint)
+        vt_pred_B_C_T_H_W, kinematic_predictions = denoise_output
 
         time_weights_B = self.rectified_flow.train_time_weight(timesteps, self.tensor_kwargs_fp32)
         per_instance_loss = torch.mean(
             (vt_pred_B_C_T_H_W - vt_B_C_T_H_W) ** 2, dim=list(range(1, vt_pred_B_C_T_H_W.dim()))
         )
 
-        loss = torch.mean(time_weights_B * per_instance_loss)
+        # Video loss (rectified flow loss)
+        video_loss = torch.mean(time_weights_B * per_instance_loss)
+        
+        # Compute kinematic loss (only if kinematic predictions are available)
+        # Original Cosmos checkpoints don't have kinematic_head, so kinematic_predictions may be None
+        if kinematic_predictions is None:
+            # No kinematic predictions available - skip kinematic loss computation
+            # This happens when using original Cosmos checkpoint without kinematic modules
+            weighted_kinematic_loss = torch.tensor(0.0, device=video_loss.device, dtype=video_loss.dtype)
+            total_loss = video_loss
+            kinematic_loss_dict = {
+                'kinematic_loss': weighted_kinematic_loss,
+                'kinematic_loss_position': torch.tensor(0.0, device=video_loss.device),
+                'kinematic_loss_velocity': torch.tensor(0.0, device=video_loss.device),
+                'kinematic_loss_acceleration': torch.tensor(0.0, device=video_loss.device),
+                'kinematic_loss_class': torch.tensor(0.0, device=video_loss.device),
+            }
+        else:
+            from cosmos_predict2._src.predict2.networks.detr_kinematic_head import compute_kinematic_loss
+            
+            target_kinematics = data_batch["kinematics"]
+            
+            # Kinematics are at pixel frame rate - need to downsample to match predictions (latent rate)
+            # Predictions are at latent temporal rate (after VAE compression)
+            pred_T = kinematic_predictions['position'].shape[1]  # [B, T_latent, N, 3]
+            target_T_pixel = target_kinematics.shape[1]  # [B, T_pixel, N, 18]
+            
+            # Verify target kinematics compress to expected latent temporal dimension
+            # VAE formula: T_latent = 1 + (T_pixel - 1) // 4
+            # Multiple T_pixel values can map to same T_latent (e.g., T_pixel 37-40 all map to T_latent=10)
+            T_latent_from_target = 1 + (target_T_pixel - 1) // 4  # Apply VAE compression formula
+            
+            assert T_latent_from_target == pred_T, (
+                f"Temporal dimension mismatch in loss computation: target T_pixel={target_T_pixel} compresses to T_latent={T_latent_from_target}, "
+                f"but predictions have T_latent={pred_T}. "
+                f"Target kinematics must compress to match prediction temporal dimension. "
+                f"Valid T_pixel range for T_latent={pred_T} is [{(pred_T - 1) * 4 + 1}, {pred_T * 4}]. "
+                f"Got target_T_pixel={target_T_pixel}."
+            )
+            
+            # Downsample target kinematics using same windowing pattern as conditioner
+            # Frame 0 alone, then windows of 4 frames
+            # Use formula-based T_latent to match conditioner: T_latent = 1 + (T_pixel - 1) // 4
+            temporal_window = 4
+            target_kinematics_downsampled_list = []
+            target_kinematics_downsampled_list.append(target_kinematics[:, 0:1, :, :])  # Frame 0
+            
+            iter_ = 1 + (target_T_pixel - 1) // temporal_window
+            # Process (iter_ - 1) windows to get exactly pred_T frames total (matching conditioner)
+            for i in range(1, iter_):
+                start_idx = 1 + temporal_window * (i - 1)
+                end_idx = 1 + temporal_window * i
+                # Use mean of window for loss computation
+                window_mean = target_kinematics[:, start_idx:end_idx, :, :].mean(dim=1, keepdim=True)
+                target_kinematics_downsampled_list.append(window_mean)
+            
+            # Note: We do NOT add remainder frames here, matching the conditioner's behavior
+            # The conditioner produces exactly T_latent = 1 + (T_pixel - 1) // 4 frames
+            
+            target_kinematics = torch.cat(target_kinematics_downsampled_list, dim=1)  # [B, T_latent, N, 18]
+            
+            # Verify downsampled shape matches predictions
+            target_T_latent = target_kinematics.shape[1]
+            assert target_T_latent == pred_T, (
+                f"Downsampled target T={target_T_latent} doesn't match pred T={pred_T}. "
+                f"This should match formula T_latent = 1 + (T_pixel - 1) // 4 = 1 + ({target_T_pixel} - 1) // 4 = {T_latent_from_target}"
+            )
+            
+            # DEBUG: Print target and prediction statistics (every 100 iterations)
+            if hasattr(self, '_iter_count'):
+                self._iter_count += 1
+            else:
+                self._iter_count = 0
+            
+            if self._iter_count % 100 == 0:
+                # Extract target values
+                tgt_pos = target_kinematics[:, :, :, 0:3]  # [B, T, N, 3]
+                tgt_vel = target_kinematics[:, :, :, 3:6]  # [B, T, N, 3]
+                tgt_acc = target_kinematics[:, :, :, 6:9]  # [B, T, N, 3]
+                tgt_class_onehot = target_kinematics[:, :, :, 14:18]  # [B, T, N, 4]
+                tgt_class = tgt_class_onehot.argmax(dim=-1)  # [B, T, N]
+                
+                # Extract prediction values
+                pred_pos = kinematic_predictions['position']  # [B, T, N, 3]
+                pred_vel = kinematic_predictions['velocity']  # [B, T, N, 3]
+                pred_acc = kinematic_predictions['acceleration']  # [B, T, N, 3]
+                pred_class_logits = kinematic_predictions['class_logits']  # [B, T, N, 5]
+                pred_class = pred_class_logits.argmax(dim=-1)  # [B, T, N]
+                
+                # Print target statistics
+                print(f"\n[Target Stats] iter={self._iter_count}")
+                print(f"  pos: mean={tgt_pos.mean().item():.4f}, std={tgt_pos.std().item():.4f}, "
+                      f"min={tgt_pos.min().item():.4f}, max={tgt_pos.max().item():.4f}")
+                print(f"  vel: mean={tgt_vel.mean().item():.4f}, std={tgt_vel.std().item():.4f}, "
+                      f"min={tgt_vel.min().item():.4f}, max={tgt_vel.max().item():.4f}")
+                print(f"  acc: mean={tgt_acc.mean().item():.4f}, std={tgt_acc.std().item():.4f}, "
+                      f"min={tgt_acc.min().item():.4f}, max={tgt_acc.max().item():.4f}")
+                # Class distribution (4-class: 0=ego, 1=vehicle, 2=person, 3=bicycle)
+                unique_classes, counts = torch.unique(tgt_class, return_counts=True)
+                class_dist = {int(c.item()): int(count.item()) for c, count in zip(unique_classes, counts)}
+                print(f"  class_dist (4-class): {class_dist}  # 0=ego, 1=vehicle, 2=person, 3=bicycle")
+                
+                # Ego class check at slot 0
+                slot0_onehot = tgt_class_onehot[:, :, 0, :]  # [B, T, 4] - one-hot at slot 0
+                slot0_class_4 = slot0_onehot.argmax(dim=-1)  # [B, T] - 4-class index
+                slot0_is_ego = (slot0_onehot[:, :, 0] == 1.0).sum().item()  # Count frames where slot 0 is ego
+                slot0_is_no_object = (slot0_onehot.sum(dim=-1) == 0).sum().item()  # Count frames where slot 0 is [0,0,0,0]
+                
+                # Convert to 5-class for display
+                slot0_class_5 = torch.where(
+                    slot0_onehot.sum(dim=-1) == 0,
+                    torch.tensor(0, device=slot0_class_4.device),  # no-object
+                    slot0_class_4 + 1  # shift: 0->1, 1->2, 2->3, 3->4
+                )
+                slot0_class_5_unique, slot0_class_5_counts = torch.unique(slot0_class_5, return_counts=True)
+                slot0_class_5_dist = {int(c.item()): int(count.item()) for c, count in zip(slot0_class_5_unique, slot0_class_5_counts)}
+                
+                print(f"  Slot 0 (query 0 target):")
+                print(f"    - One-hot [ego,vehicle,person,bicycle]: {slot0_onehot[0, 0].cpu().tolist()} (example first frame)")
+                print(f"    - 4-class index: {torch.unique(slot0_class_4, return_counts=True)}")
+                print(f"    - 5-class index: {slot0_class_5_dist}  # 0=no-object, 1=ego, 2=vehicle, 3=person, 4=bicycle")
+                print(f"    - Is ego [1,0,0,0]: {slot0_is_ego} frames")
+                print(f"    - Is no-object [0,0,0,0]: {slot0_is_no_object} frames")
+                print(f"    - Expected: ego (4-class=0, 5-class=1) for ALL frames")
+                
+                # Print prediction statistics
+                print(f"[Pred Stats] iter={self._iter_count}")
+                print(f"  pos: mean={pred_pos.mean().item():.4f}, std={pred_pos.std().item():.4f}, "
+                      f"min={pred_pos.min().item():.4f}, max={pred_pos.max().item():.4f}")
+                print(f"  vel: mean={pred_vel.mean().item():.4f}, std={pred_vel.std().item():.4f}, "
+                      f"min={pred_vel.min().item():.4f}, max={pred_vel.max().item():.4f}")
+                print(f"  acc: mean={pred_acc.mean().item():.4f}, std={pred_acc.std().item():.4f}, "
+                      f"min={pred_acc.min().item():.4f}, max={pred_acc.max().item():.4f}")
+                # Class distribution (5-class: 0=no-object, 1=ego, 2=vehicle, 3=person, 4=bicycle)
+                unique_classes, counts = torch.unique(pred_class, return_counts=True)
+                class_dist = {int(c.item()): int(count.item()) for c, count in zip(unique_classes, counts)}
+                print(f"  class_dist (5-class): {class_dist}  # 0=no-object, 1=ego, 2=vehicle, 3=person, 4=bicycle")
+                
+                # Query 0 prediction check
+                query0_class = pred_class[:, :, 0]  # [B, T] - Query 0 predictions
+                query0_class_unique, query0_class_counts = torch.unique(query0_class, return_counts=True)
+                query0_class_dist = {int(c.item()): int(count.item()) for c, count in zip(query0_class_unique, query0_class_counts)}
+                
+                # Get query 0 logits to see confidence
+                query0_logits = pred_class_logits[:, :, 0, :]  # [B, T, 5]
+                query0_logits_mean = query0_logits.mean(dim=(0, 1))  # [5] - average logits
+                
+                print(f"  Query 0 predictions:")
+                print(f"    - Class distribution: {query0_class_dist}")
+                print(f"    - Predicts ego (class 1): {(query0_class == 1).sum().item()}/{query0_class.numel()} frames")
+                print(f"    - Average logits: no-obj={query0_logits_mean[0]:.3f}, ego={query0_logits_mean[1]:.3f}, vehicle={query0_logits_mean[2]:.3f}, person={query0_logits_mean[3]:.3f}, bicycle={query0_logits_mean[4]:.3f}")
+                print(f"    - Expected: ALWAYS predict ego (class 1)")
+                print()
+        
+        kinematic_loss_dict = compute_kinematic_loss(
+            predictions=kinematic_predictions,
+            target_kinematics=target_kinematics,
+                loss_weights={'pos': 1.0, 'vel': 0.5, 'acc': 0.1, 'cls': 0.5, 'ego': 0.5},
+        )
+        
+        # Add kinematic loss to total loss (with configurable weight)
+        kinematic_loss_weight = getattr(self.config, 'kinematic_loss_weight', 0.1)
+        weighted_kinematic_loss = kinematic_loss_weight * kinematic_loss_dict['kinematic_loss']
+        total_loss = video_loss + weighted_kinematic_loss
+        
+        # Print losses for monitoring
+        print(
+            f"[Loss] video_loss: {video_loss.item():.6f} | "
+            f"kinematic_loss: {kinematic_loss_dict['kinematic_loss'].item():.6f} "
+            f"(weighted: {weighted_kinematic_loss.item():.6f}, weight: {kinematic_loss_weight}) | "
+            f"total_loss: {total_loss.item():.6f}"
+        )
+        
+        # Print detailed kinematic loss breakdown
+        if kinematic_predictions is not None:
+            print(
+                f"[Kinematic Loss Breakdown] "
+                f"pos: {kinematic_loss_dict['kinematic_loss_position'].item():.4f} | "
+                f"vel: {kinematic_loss_dict['kinematic_loss_velocity'].item():.4f} | "
+                f"acc: {kinematic_loss_dict['kinematic_loss_acceleration'].item():.4f} | "
+                f"cls: {kinematic_loss_dict['kinematic_loss_class'].item():.4f} | "
+                f"ego_vel: {kinematic_loss_dict['kinematic_loss_ego_velocity'].item():.4f} | "
+                f"ego_acc: {kinematic_loss_dict['kinematic_loss_ego_acceleration'].item():.4f} | "
+                f"ego_cls: {kinematic_loss_dict['kinematic_loss_ego_class'].item():.4f}"
+        )
+        
+        # Add individual kinematic losses to output for logging
         output_batch = {
             "x0": x0_B_C_T_H_W,
             "xt": xt_B_C_T_H_W,
             "sigma": sigmas,
             "condition": condition,
             "model_pred": vt_pred_B_C_T_H_W,
-            "edm_loss": loss,
+            "video_loss": video_loss,  # Video/rectified flow loss only (new name)
+            "edm_loss": video_loss,  # Backward compatibility: alias for video_loss (wandb callback expects this)
+            "kinematic_loss_weight": kinematic_loss_weight,  # Log the weight being used
+            **kinematic_loss_dict,  # Add all kinematic losses (includes 'kinematic_loss', 'kinematic_loss_position', etc.)
         }
 
-        return output_batch, loss
+        return output_batch, total_loss
 
     def get_data_and_condition(self, data_batch: dict[str, torch.Tensor]) -> Tuple[Tensor, Tensor, Text2WorldCondition]:
         self._normalize_video_databatch_inplace(data_batch)
@@ -919,6 +1262,8 @@ class Text2WorldModelRectifiedFlow(ImaginaireModel):
 
         # Latent state
         raw_state = data_batch[self.input_image_key if is_image_batch else self.input_data_key]
+        
+        
         latent_state = self.encode(raw_state).contiguous().float()
 
         # Condition
@@ -1008,25 +1353,21 @@ class Text2WorldModelRectifiedFlow(ImaginaireModel):
 
         state_dict = _reg_state_dict
 
-        if strict:
-            reg_results: _IncompatibleKeys = self.net.load_state_dict(_reg_state_dict, strict=strict, assign=assign)
+        # Always use strict mode to ensure code and weights correspond correctly
+        # This ensures that missing kinematic modules in original checkpoints will raise errors
+        # rather than silently using randomly initialized modules
+        reg_results: _IncompatibleKeys = self.net.load_state_dict(_reg_state_dict, strict=True, assign=assign)
 
-            if self.config.ema.enabled:
-                ema_results: _IncompatibleKeys = self.net_ema.load_state_dict(
-                    _ema_state_dict, strict=strict, assign=assign
-                )
-
-            return _IncompatibleKeys(
-                missing_keys=reg_results.missing_keys + (ema_results.missing_keys if self.config.ema.enabled else []),
-                unexpected_keys=reg_results.unexpected_keys
-                + (ema_results.unexpected_keys if self.config.ema.enabled else []),
+        if self.config.ema.enabled:
+            ema_results: _IncompatibleKeys = self.net_ema.load_state_dict(
+                _ema_state_dict, strict=True, assign=assign
             )
-        else:
-            log.critical("load model in non-strict mode")
-            log.critical(non_strict_load_model(self.net, _reg_state_dict), rank0_only=False)
-            if self.config.ema.enabled:
-                log.critical("load ema model in non-strict mode")
-                log.critical(non_strict_load_model(self.net_ema, _ema_state_dict), rank0_only=False)
+
+        return _IncompatibleKeys(
+            missing_keys=reg_results.missing_keys + (ema_results.missing_keys if self.config.ema.enabled else []),
+            unexpected_keys=reg_results.unexpected_keys
+            + (ema_results.unexpected_keys if self.config.ema.enabled else []),
+        )
 
     # ------------------ public methods ------------------
     def ema_beta(self, iteration: int) -> float:
@@ -1092,7 +1433,11 @@ class Text2WorldModelRectifiedFlow(ImaginaireModel):
         return self.tokenizer.encode(state)
 
     @torch.no_grad()
-    def decode(self, latent: torch.Tensor) -> torch.Tensor:
+    def decode(self, latent: torch.Tensor | tuple) -> torch.Tensor:
+        # Handle case where generate_samples_from_batch returns (latents, kinematic_predictions)
+        # Extract just the latents tensor if a tuple is passed
+        if isinstance(latent, tuple):
+            latent = latent[0]  # Extract latents from tuple
         return self.tokenizer.decode(latent)
 
     def get_video_height_width(self) -> Tuple[int, int]:

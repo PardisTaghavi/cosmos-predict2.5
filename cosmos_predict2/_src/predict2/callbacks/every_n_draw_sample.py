@@ -328,7 +328,28 @@ class EveryNDrawSample(EveryN):
         return None
 
     def run_save(self, to_show, batch_size, base_fp_wo_ext) -> Optional[str]:
-        to_show = (1.0 + torch.stack(to_show, dim=0).clamp(-1, 1)) / 2.0  # [n, b, c, t, h, w]
+        # Handle variable-length videos by padding to max temporal dimension
+        # Find maximum temporal dimension across all videos
+        # Videos are expected to be [B, C, T, H, W] after decode
+        max_t = max(video.shape[2] for video in to_show if len(video.shape) == 5)
+        
+        # Pad all videos to max_t before stacking
+        padded_to_show = []
+        for video in to_show:
+            if len(video.shape) == 5:
+                B, C, T, H, W = video.shape
+                if T < max_t:
+                    # Pad along temporal dimension: pad last frames with zeros
+                    # Use the last frame value for padding (better than zeros for visualization)
+                    last_frame = video[:, :, -1:, :, :]  # [B, C, 1, H, W]
+                    padding = last_frame.repeat(1, 1, max_t - T, 1, 1)  # [B, C, max_t - T, H, W]
+                    video = torch.cat([video, padding], dim=2)
+                padded_to_show.append(video)
+            else:
+                # Unexpected shape, try to handle gracefully
+                padded_to_show.append(video)
+        
+        to_show = (1.0 + torch.stack(padded_to_show, dim=0).clamp(-1, 1)) / 2.0  # [n, b, c, t, h, w]
         is_single_frame = to_show.shape[3] == 1
         n_viz_sample = min(self.n_viz_sample, batch_size)
 

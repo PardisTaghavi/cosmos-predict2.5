@@ -31,6 +31,7 @@ from cosmos_predict2._src.predict2.models.text2world_model_rectified_flow import
     Text2WorldModelRectifiedFlowConfig,
 )
 
+
 NUM_CONDITIONAL_FRAMES_KEY: str = "num_conditional_frames"
 
 
@@ -74,18 +75,21 @@ class Video2WorldModelRectifiedFlow(Text2WorldModelRectifiedFlow):
         )
         return raw_state, latent_state, condition
 
+
     def denoise(
         self,
         noise: torch.Tensor,
         xt_B_C_T_H_W: torch.Tensor,
         timesteps_B_T: torch.Tensor,
         condition: Text2WorldCondition,
+        kinematics: Optional[torch.Tensor] = None,
     ) -> DenoisePrediction:
         """
         Args:
             xt (torch.Tensor): The input noise data.
             sigma (torch.Tensor): The noise level.
             condition (Text2WorldCondition): conditional information, generated from self.conditioner
+            kinematics (torch.Tensor, optional): Kinematic data [B, T, N, 13]
 
         Returns:
             velocity prediction
@@ -122,11 +126,16 @@ class Video2WorldModelRectifiedFlow(Text2WorldModelRectifiedFlow):
                 )  # add dimension for batch
 
         # forward pass through the network
-        net_output_B_C_T_H_W = self.net(
+        net_out = self.net(
             x_B_C_T_H_W=xt_B_C_T_H_W.to(**self.tensor_kwargs),  # Eq. 7 of https://arxiv.org/pdf/2206.00364.pdf
             timesteps_B_T=timesteps_B_T,  # Eq. 7 of https://arxiv.org/pdf/2206.00364.pdf
+            kinematics=kinematics,  # Pass kinematics to network (required)
             **condition.to_dict(),
-        ).float()
+        )
+        
+        # Unpack network output (always returns video + kinematic predictions)
+        net_output_B_C_T_H_W, kinematic_predictions = net_out
+        net_output_B_C_T_H_W = net_output_B_C_T_H_W.float()
 
         if condition.is_video and self.config.denoise_replace_gt_frames:
             gt_frames_x0 = condition.gt_frames.type_as(net_output_B_C_T_H_W)
@@ -135,13 +144,14 @@ class Video2WorldModelRectifiedFlow(Text2WorldModelRectifiedFlow):
                 1 - condition_video_mask
             )
 
-        return net_output_B_C_T_H_W
+        return net_output_B_C_T_H_W, kinematic_predictions
 
     def get_velocity_fn_from_batch(
         self,
         data_batch: Dict,
         guidance: float = 1.5,
         is_negative_prompt: bool = False,
+        kinematics: Optional[torch.Tensor] = None,
     ) -> Callable:
         """
         Generates a callable function `x0_fn` based on the provided data batch and guidance factor.
@@ -203,12 +213,18 @@ class Video2WorldModelRectifiedFlow(Text2WorldModelRectifiedFlow):
                 "parallel_state is not initialized, context parallel should be turned off."
             )
 
+        # Store kinematic predictions from last denoise call
+        kinematic_predictions_store = {"value": None}
+        
         def velocity_fn(noise: torch.Tensor, noise_x: torch.Tensor, timestep: torch.Tensor) -> torch.Tensor:
-            cond_v = self.denoise(noise, noise_x, timestep, condition)
-            uncond_v = self.denoise(noise, noise_x, timestep, uncondition)
+            cond_v, cond_kin = self.denoise(noise, noise_x, timestep, condition, kinematics=kinematics)
+            uncond_v, _ = self.denoise(noise, noise_x, timestep, uncondition, kinematics=None)
             velocity_pred = cond_v + guidance * (cond_v - uncond_v)
+            # Store kinematic predictions from conditioned denoise (last call will be final prediction)
+            kinematic_predictions_store["value"] = cond_kin
             return velocity_pred
 
+        velocity_fn.kinematic_predictions_store = kinematic_predictions_store
         return velocity_fn
 
     def denoise_edm(
@@ -338,6 +354,13 @@ class Video2WorldModelRectifiedFlow(Text2WorldModelRectifiedFlow):
         if net_type == "fake_score":
             return DenoisePrediction(x0=x0_pred_B_C_T_H_W, intermediate_features=intermediate_features_outputs)
         else:  # student and teacher need F
+            F_pred_B_C_T_H_W = (torch.cos(time_B_1_T_1_1) * xt_B_C_T_H_W - x0_pred_B_C_T_H_W) / (
+                torch.sin(time_B_1_T_1_1) * self.sigma_data
+            )
+            return DenoisePrediction(
+                x0=x0_pred_B_C_T_H_W, F=F_pred_B_C_T_H_W, intermediate_features=intermediate_features_outputs
+            )
+
             F_pred_B_C_T_H_W = (torch.cos(time_B_1_T_1_1) * xt_B_C_T_H_W - x0_pred_B_C_T_H_W) / (
                 torch.sin(time_B_1_T_1_1) * self.sigma_data
             )

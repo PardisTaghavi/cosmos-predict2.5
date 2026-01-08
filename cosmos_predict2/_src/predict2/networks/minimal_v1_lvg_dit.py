@@ -7,6 +7,7 @@
 #
 # http://www.apache.org/licenses/LICENSE-2.0
 #
+
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -39,6 +40,7 @@ class MinimalV1LVGDiT(MiniTrainDIT):
         data_type: Optional[DataType] = DataType.VIDEO,
         intermediate_feature_ids: Optional[List[int]] = None,
         img_context_emb: Optional[torch.Tensor] = None,
+        kinematics: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor | List[torch.Tensor] | Tuple[torch.Tensor, List[torch.Tensor]]:
         del kwargs
@@ -59,4 +61,5 @@ class MinimalV1LVGDiT(MiniTrainDIT):
             data_type=data_type,
             intermediate_feature_ids=intermediate_feature_ids,
             img_context_emb=img_context_emb,
+            kinematics=kinematics,
         )

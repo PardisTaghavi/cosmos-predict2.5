@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 """
 # Script for generating I2W videos in s3
 PYTHONPATH=. python cosmos_predict2/_src/predict2/inference/video2world.py --experiment=Stage-c_pt_4-reason_embeddings-Index-26-Size-2B-Res-720-Fps-16-Note-HQ_V6_from_22_qwen_concat_resume4 --ckpt_path s3://bucket/cosmos_diffusion_v2/official_runs_vid2vid/Stage-c_pt_4-reason_embeddings-Index-26-Size-2B-Res-720-Fps-16-Note-HQ_V6_from_22_qwen_concat_resume4/checkpoints/iter_000045000 --save_root results/cli_debug_from_s3 --input_root /project/cosmos/ybalaji/data/internal_val_set_clean
@@ -55,6 +56,7 @@ import math
 import os
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
 import torchvision
 from megatron.core import parallel_state
@@ -335,6 +337,17 @@ class Video2WorldInference:
 
             model: Video2WorldModelRectifiedFlow = model
 
+        # Print model temporal capacity information
+        state_t = model.config.state_t
+        pixel_num_frames = model.tokenizer.get_pixel_num_frames(state_t)
+        print("="*70)
+        print("Model Temporal Capacity Information:")
+        print(f"  state_t (latent frames): {state_t}")
+        print(f"  pixel_num_frames (native capacity): {pixel_num_frames}")
+        print(f"  VAE temporal compression: 4x")
+        print(f"  Formula: pixel_frames = (state_t - 1) * 4 + 1")
+        print("="*70)
+
         # Enable context parallel on the model if using context parallelism
         if self.context_parallel_size > 1:
             model.net.enable_context_parallel(self.process_group)
@@ -370,6 +383,7 @@ class Video2WorldInference:
         use_neg_prompt: bool = True,
         camera: torch.Tensor | None = None,
         action: torch.Tensor | None = None,
+        kinematics: torch.Tensor | None = None,
     ):
         """
         Prepares the input data batch for the diffusion model.
@@ -401,6 +415,10 @@ class Video2WorldInference:
             "padding_mask": torch.zeros(self.batch_size, 1, H, W),  # Padding mask (assumed no padding here)
             "num_conditional_frames": num_conditional_frames,  # Specify number of conditional frames
         }
+        
+        # Add kinematics if provided
+        if kinematics is not None:
+            data_batch["kinematics"] = kinematics
 
         if use_neg_prompt:
             assert negative_prompt is not None, "Negative prompt is required when use_neg_prompt is True"
@@ -429,6 +447,190 @@ class Video2WorldInference:
 
         return data_batch
 
+    def _load_kinematics_from_file(
+        self,
+        kinematics_path: str,
+        num_pixel_frames: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """
+        Load kinematics from H5 or NPY file for inference.
+        
+        Args:
+            kinematics_path: Path to .h5 or .npy file containing kinematics
+            num_pixel_frames: Number of pixel frames to load (will take first N frames)
+            device: Device to load kinematics on
+        
+        Returns:
+            kinematics: [1, T_pixel, N, 18] tensor at pixel frame rate
+        """
+        import h5py
+        import numpy as np
+        
+        if kinematics_path.endswith('.h5'):
+            with h5py.File(kinematics_path, 'r') as f:
+                if 'frames' not in f:
+                    raise KeyError(f"'frames' dataset not found in {kinematics_path}. Available keys: {list(f.keys())}")
+                kin_data = f['frames'][:]  # [T, N, 18]
+        elif kinematics_path.endswith('.npy'):
+            kin_data = np.load(kinematics_path)  # [T, N, 18]
+        else:
+            raise ValueError(f"Unsupported kinematics file format: {kinematics_path}. Expected .h5 or .npy")
+        
+        # Take first num_pixel_frames
+        if kin_data.shape[0] < num_pixel_frames:
+            log.warning(
+                f"Kinematics file has {kin_data.shape[0]} frames but {num_pixel_frames} requested. "
+                f"Padding with last frame."
+            )
+            # Pad with last frame
+            last_frame = kin_data[-1:, :, :]  # [1, N, 18]
+            padding_frames = num_pixel_frames - kin_data.shape[0]
+            padding = np.repeat(last_frame, padding_frames, axis=0)
+            kin_data = np.concatenate([kin_data, padding], axis=0)
+        else:
+            kin_data = kin_data[:num_pixel_frames]
+        
+        # Convert to tensor: [1, T_pixel, N, 18]
+        kinematics = torch.from_numpy(kin_data).float().unsqueeze(0).to(device)
+        return kinematics
+
+    def _upsample_kinematics_to_pixel_rate(
+        self,
+        kinematic_predictions: dict,
+        T_pixel_target: int,
+    ) -> torch.Tensor:
+        """
+        Upsample kinematic predictions from latent rate to pixel rate.
+        
+        Kinematic predictions are at latent rate [B, T_latent, N, 14] (or 18 if full format).
+        Need to upsample to pixel rate [B, T_pixel, N, 18] for next chunk conditioning.
+        
+        Args:
+            kinematic_predictions: Dictionary with 'position', 'velocity', 'acceleration', 'class_logits'
+                Each is [B, T_latent, N, F] where F is feature dimension
+            T_pixel_target: Target number of pixel frames
+        
+        Returns:
+            kinematics_pixel: [B, T_pixel, N, 18] tensor at pixel frame rate
+        """
+        # Extract components
+        position = kinematic_predictions['position']  # [B, T_latent, N, 3]
+        velocity = kinematic_predictions['velocity']  # [B, T_latent, N, 3]
+        acceleration = kinematic_predictions['acceleration']  # [B, T_latent, N, 3]
+        class_logits = kinematic_predictions['class_logits']  # [B, T_latent, N, 5]
+        
+        B, T_latent, N, _ = position.shape
+        
+        # Convert 5-class logits to 4-class one-hot for compatibility with 18D format
+        # Prediction 5 classes: 0=no-object, 1=ego, 2=vehicle, 3=person, 4=bicycle
+        # Target 4 classes: 0=ego, 1=vehicle, 2=person, 3=bicycle
+        class_probs = torch.softmax(class_logits, dim=-1)  # [B, T_latent, N, 5]
+        class_idx_5 = class_probs.argmax(dim=-1)  # [B, T_latent, N] - class indices 0-4
+        
+        # Convert to 4-class one-hot: if class_idx_5 == 0 (no-object) -> all zeros
+        # else: class_idx_5 - 1 maps to 4-class index (1->0, 2->1, 3->2, 4->3)
+        class_onehot_4 = torch.zeros(B, T_latent, N, 4, device=class_logits.device, dtype=class_logits.dtype)
+        # Only set one-hot for non-no-object classes
+        valid_mask = class_idx_5 > 0  # [B, T_latent, N] - true for objects
+        class_idx_4 = class_idx_5[valid_mask] - 1  # [num_valid] - map 1->0, 2->1, 3->2, 4->3
+        class_onehot_4[valid_mask].scatter_(-1, class_idx_4.unsqueeze(-1), 1.0)
+        
+        # Concatenate to [B, T_latent, N, 14]
+        kinematics_latent = torch.cat([
+            position,      # 3
+            velocity,      # 3
+            acceleration,  # 3
+            class_logits,  # 5
+        ], dim=-1)
+        
+        # Pad to 18D format: add zeros for dimensions, yaw, tracking_id
+        # Format: [pos(3), vel(3), acc(3), dims(3), yaw(1), track_id(1), class(4)] = 18
+        zeros_dims = torch.zeros(B, T_latent, N, 3, device=kinematics_latent.device, dtype=kinematics_latent.dtype)
+        zeros_yaw = torch.zeros(B, T_latent, N, 1, device=kinematics_latent.device, dtype=kinematics_latent.dtype)
+        zeros_track = torch.zeros(B, T_latent, N, 1, device=kinematics_latent.device, dtype=kinematics_latent.dtype)
+        
+        kinematics_18d = torch.cat([
+            kinematics_latent[..., :3],   # position
+            kinematics_latent[..., 3:6],  # velocity
+            kinematics_latent[..., 6:9],  # acceleration
+            zeros_dims,                   # dimensions (not predicted)
+            zeros_yaw,                     # yaw (not predicted)
+            zeros_track,                   # tracking_id (not predicted)
+            class_onehot_4,                # class one-hot (4 classes)
+        ], dim=-1)  # [B, T_latent, N, 18]
+        
+        # Upsample from latent rate to pixel rate using linear interpolation
+        # VAE compression: T_latent = 1 + (T_pixel - 1) // 4
+        # Inverse: T_pixel = (T_latent - 1) * 4 + 1
+        # But we need to handle arbitrary T_pixel_target
+        
+        # Use linear interpolation along temporal dimension
+        kinematics_18d_permuted = kinematics_18d.permute(0, 2, 1, 3)  # [B, N, T_latent, 18]
+        kinematics_18d_reshaped = kinematics_18d_permuted.reshape(B * N, T_latent, 18)  # [B*N, T_latent, 18]
+        
+        # Create indices for interpolation
+        indices = torch.linspace(0, T_latent - 1, T_pixel_target, device=kinematics_18d.device)
+        indices_floor = indices.floor().long()
+        indices_ceil = torch.clamp(indices_floor + 1, max=T_latent - 1)
+        alpha = (indices - indices_floor).unsqueeze(-1)  # [T_pixel, 1]
+        
+        # Linear interpolation
+        floor_values = kinematics_18d_reshaped[:, indices_floor, :]  # [B*N, T_pixel, 18]
+        ceil_values = kinematics_18d_reshaped[:, indices_ceil, :]   # [B*N, T_pixel, 18]
+        interpolated = floor_values * (1 - alpha) + ceil_values * alpha  # [B*N, T_pixel, 18]
+        
+        # Reshape back: [B*N, T_pixel, 18] -> [B, N, T_pixel, 18] -> [B, T_pixel, N, 18]
+        kinematics_pixel = interpolated.reshape(B, N, T_pixel_target, 18).permute(0, 2, 1, 3)
+        
+        return kinematics_pixel
+
+    def _print_kinematic_predictions(self, kinematic_predictions: dict, frame_offset: int = 0):
+        """
+        Print kinematic predictions for each frame with actual numerical values.
+        
+        Args:
+            kinematic_predictions: Dictionary with kinematic predictions
+            frame_offset: Offset to add to frame numbers (for autoregressive chunks)
+        """
+        if kinematic_predictions is None:
+            return
+        
+        position = kinematic_predictions['position']  # [B, T_latent, N, 3]
+        velocity = kinematic_predictions['velocity']  # [B, T_latent, N, 3]
+        acceleration = kinematic_predictions['acceleration']  # [B, T_latent, N, 3]
+        class_logits = kinematic_predictions['class_logits']  # [B, T_latent, N, 5]
+        kinematics = kinematic_predictions['kinematics']  # [B, T_latent, N, 14]
+        
+        B, T_latent, N, _ = position.shape
+        
+        for t in range(T_latent):
+            frame_num = frame_offset + t + 1
+            print(f"\nframe {frame_num}:")
+            print(f"   {{")
+            
+            # Convert tensors to numpy arrays (convert to float32 first to handle BFloat16)
+            pos_np = position[0, t, :, :].detach().cpu().float().numpy()
+            vel_np = velocity[0, t, :, :].detach().cpu().float().numpy()
+            acc_np = acceleration[0, t, :, :].detach().cpu().float().numpy()
+            cls_np = class_logits[0, t, :, :].detach().cpu().float().numpy()
+            kin_np = kinematics[0, t, :, :].detach().cpu().float().numpy()
+            
+            # Convert class logits to class predictions
+            # class_logits shape: [N, 5] where indices are [0=no-object, 1=ego, 2=vehicle, 3=person, 4=bicycle]
+            # Use softmax + argmax to get class predictions
+            cls_probs = np.exp(cls_np - np.max(cls_np, axis=-1, keepdims=True))  # [N, 5] - numerical stability
+            cls_probs = cls_probs / cls_probs.sum(axis=-1, keepdims=True)  # normalize
+            class_predictions = np.argmax(cls_probs, axis=-1)  # [N] - class indices 0-4
+            
+            # Print with actual values
+            print(f"       'position': {pos_np.tolist()},      # (x, y, z) in meters")
+            print(f"       'velocity': {vel_np.tolist()},     # (vx, vy, vz) in m/s")
+            print(f"       'acceleration': {acc_np.tolist()}, # (ax, ay, az) in m/s²")
+            print(f"       'class': {class_predictions.tolist()}, # 0=no-object, 1=ego, 2=vehicle, 3=person, 4=bicycle")
+            print(f"       'kinematics': {kin_np.tolist()}   # concatenated [pos(3), vel(3), acc(3), cls(5)]")
+            print(f"   }}")
+
     def generate_vid2world(
         self,
         prompt: str,
@@ -443,8 +645,10 @@ class Video2WorldInference:
         negative_prompt: str = _DEFAULT_NEGATIVE_PROMPT,
         camera: torch.Tensor | None = None,
         action: torch.Tensor | None = None,
+        kinematics: torch.Tensor | None = None,
+        kinematics_path: str | None = None,
         num_steps: int = 35,
-    ):
+    ) -> tuple[torch.Tensor, dict | None]:
         """
         Generates a video based on an input image or video and text prompt.
 
@@ -462,13 +666,14 @@ class Video2WorldInference:
             negative_prompt: Custom negative prompt. Defaults to the predefined default negative prompt.
             camera: Target camera extrinsics and intrinsics for the K output videos. Must be provided if model is camera conditioned.
             action: Target robot action for the K output videos. Must be provided if model is action conditioned.
+            kinematics: Kinematic conditioning tensor [1, T_pixel, N, 18] at pixel frame rate. Optional.
+            kinematics_path: Path to .h5 or .npy file containing kinematics. Optional. If provided, will load kinematics from file.
             num_steps: Number of generation steps. Defaults to 35.
-            offload_diffusion_model: If True, offload diffusion model to CPU to save GPU memory. Defaults to False.
-            offload_text_encoder: If True, offload text encoder to CPU to save GPU memory. Defaults to False.
-            offload_tokenizer: If True, offload tokenizer to CPU to save GPU memory. Defaults to False.
 
         Returns:
-            torch.Tensor: The generated video tensor (B, C, T, H, W) in the range [-1, 1].
+            tuple: (video_tensor, kinematic_predictions)
+                - video_tensor: The generated video tensor (B, C, T, H, W) in the range [-1, 1]
+                - kinematic_predictions: Dictionary with kinematic predictions at latent rate, or None if not available
         """
         assert camera is not None or action is not None or num_input_video == 1 and num_output_video == 1, (
             "expected num_output_video==1 and num_output_video==1 for no camera conditioning or action conditioning"
@@ -485,6 +690,12 @@ class Video2WorldInference:
 
         # Get the correct number of frames needed by the model
         model_required_frames = self.model.tokenizer.get_pixel_num_frames(self.model.config.state_t)
+
+        # Load kinematics from file if path provided
+        if kinematics is None and kinematics_path is not None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            kinematics = self._load_kinematics_from_file(kinematics_path, num_video_frames, device)
+            log.info(f"Loaded kinematics from {kinematics_path}: shape {kinematics.shape}")
 
         # Determine if input is image or video and process accordingly
         if input_path is None or num_latent_conditional_frames == 0:
@@ -529,6 +740,7 @@ class Video2WorldInference:
             num_conditional_frames=num_latent_conditional_frames,
             negative_prompt=negative_prompt,
             use_neg_prompt=True,
+            kinematics=kinematics,
         )
 
         mem_bytes = torch.cuda.memory_allocated(device=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
@@ -575,15 +787,55 @@ class Video2WorldInference:
             generate_samples = self.model.generate_samples_from_batch_lora
         else:
             generate_samples = self.model.generate_samples_from_batch
-        sample = generate_samples(
+        
+        # Extract kinematics from data_batch for velocity function
+        kinematics_for_velocity = data_batch.get("kinematics", None)
+        
+        result = generate_samples(
             data_batch,
             n_sample=1,  # Generate one sample
             guidance=guidance,
             seed=seed,  # Fixed seed for reproducibility
             is_negative_prompt=True,  # Use classifier-free guidance
             num_steps=num_steps,
+            kinematics=kinematics_for_velocity,
             **extra_kwargs,
         )
+        
+        # Handle return value: could be (sample,) or (sample, kinematic_predictions)
+        if isinstance(result, tuple) and len(result) == 2:
+            sample, kinematic_predictions = result
+        elif isinstance(result, tuple) and len(result) == 1:
+            sample = result[0]
+            kinematic_predictions = None
+        else:
+            sample = result
+            kinematic_predictions = None
+        
+        # Denormalize kinematic predictions from [-1, 1] back to original scale
+        if kinematic_predictions is not None:
+            from cosmos_predict2._src.predict2.networks.detr_kinematic_head import denormalize_kinematics
+            
+            # Denormalize position, velocity, acceleration
+            pos_denorm, vel_denorm, acc_denorm = denormalize_kinematics(
+                kinematic_predictions['position'],
+                kinematic_predictions['velocity'],
+                kinematic_predictions['acceleration'],
+            )
+            
+            # Update predictions with denormalized values
+            kinematic_predictions['position'] = pos_denorm
+            kinematic_predictions['velocity'] = vel_denorm
+            kinematic_predictions['acceleration'] = acc_denorm
+            
+            # Update concatenated kinematics tensor
+            # kinematics = [pos(3), vel(3), acc(3), cls(5)]
+            kinematic_predictions['kinematics'] = torch.cat([
+                pos_denorm,      # 3
+                vel_denorm,      # 3
+                acc_denorm,      # 3
+                kinematic_predictions['class_logits'],  # 5
+            ], dim=-1)  # [B, T, N, 14]
 
         # Memory Optimization Step 4: Offload Diffusion Network
         # Offload diffusion network after sampling to make room for decoder
@@ -618,6 +870,13 @@ class Video2WorldInference:
         else:
             # Decode the latent sample into a video tensor
             video = self.model.decode(sample)
+        
+        video = video.clip(min=-1, max=1)
+
+        # Print kinematic predictions for each frame
+        if kinematic_predictions is not None:
+            print("\n=== Kinematic Predictions ===")
+            self._print_kinematic_predictions(kinematic_predictions, frame_offset=0)
 
         # Memory Optimization Step 6: Final Cleanup
         # Offload decoder after decoding & reload the tokenizer for the next inference call
@@ -634,7 +893,7 @@ class Video2WorldInference:
                 self.model.text_encoder.model = self.model.text_encoder.model.to("cuda")
             torch.cuda.empty_cache()
 
-        return video
+        return video, kinematic_predictions
 
     def generate_autoregressive_from_batch(
         self,
@@ -650,6 +909,8 @@ class Video2WorldInference:
         negative_prompt: str = _DEFAULT_NEGATIVE_PROMPT,
         camera: torch.Tensor | None = None,
         action: torch.Tensor | None = None,
+        kinematics: torch.Tensor | None = None,
+        kinematics_path: str | None = None,
         num_steps: int = 35,
     ) -> torch.Tensor:
         """
@@ -668,6 +929,8 @@ class Video2WorldInference:
             negative_prompt: Custom negative prompt.
             camera: Target camera extrinsics and intrinsics for the K output videos.
             action: Target robot action for the K output videos.
+            kinematics: Full kinematic sequence [1, T_total, N, 18] at pixel frame rate. Optional.
+            kinematics_path: Path to .h5 or .npy file containing kinematics. Optional.
             num_steps: Number of generation steps.
 
         Returns:
@@ -779,8 +1042,15 @@ class Video2WorldInference:
             f"for {num_output_frames} total frames"
         )
 
+        # Load kinematics if path provided
+        if kinematics is None and kinematics_path is not None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            kinematics = self._load_kinematics_from_file(kinematics_path, num_output_frames, device)
+            log.info(f"Loaded kinematics from {kinematics_path}: shape {kinematics.shape}")
+
         # Generate chunks
         current_input_video = full_input_video.clone()
+        predicted_kinematics_pixel = None  # Store predicted kinematics at pixel rate for next chunk
 
         for chunk_idx in range(num_chunks):
             # Calculate frame range for this chunk
@@ -815,8 +1085,38 @@ class Video2WorldInference:
             else:
                 chunk_num_conditional = chunk_overlap
 
-            # Generate chunk
-            chunk_video = self.generate_vid2world(
+            # Determine kinematic conditioning for this chunk
+            chunk_kinematics = None
+            if chunk_idx == 0:
+                # First chunk: Use GT kinematics for conditioned frames only
+                if kinematics is not None:
+                    num_conditional_pixel_frames = 4 * (num_latent_conditional_frames - 1) + 1
+                    chunk_kinematics = kinematics[:, :num_conditional_pixel_frames, :, :]  # [1, T_cond, N, 18]
+                    log.info(
+                        f"Chunk {chunk_idx + 1}: Using GT kinematics for {num_conditional_pixel_frames} conditioned frames"
+                    )
+            else:
+                # Subsequent chunks: Use predicted kinematics from previous chunk
+                if predicted_kinematics_pixel is not None:
+                    # Extract overlap region from predicted kinematics
+                    overlap_pixel_frames = 4 * (chunk_overlap - 1) + 1
+                    chunk_kinematics = predicted_kinematics_pixel[:, -overlap_pixel_frames:, :, :]  # [1, T_overlap, N, 18]
+                    log.info(
+                        f"Chunk {chunk_idx + 1}: Using predicted kinematics for {overlap_pixel_frames} overlap frames"
+                    )
+                elif kinematics is not None:
+                    # Fallback: Use GT kinematics for overlap if predictions not available
+                    overlap_start = start_frame
+                    overlap_pixel_frames = 4 * (chunk_overlap - 1) + 1
+                    overlap_end = min(overlap_start + overlap_pixel_frames, num_output_frames)
+                    chunk_kinematics = kinematics[:, overlap_start:overlap_end, :, :]
+                    log.info(
+                        f"Chunk {chunk_idx + 1}: Using GT kinematics for overlap (fallback): "
+                        f"frames {overlap_start}-{overlap_end}"
+                    )
+
+            # Generate chunk with kinematic conditioning
+            chunk_video, chunk_kinematic_predictions = self.generate_vid2world(
                 prompt=prompt,
                 input_path=chunk_input,
                 guidance=guidance,
@@ -827,8 +1127,9 @@ class Video2WorldInference:
                 negative_prompt=negative_prompt,
                 camera=camera,
                 action=action,
+                kinematics=chunk_kinematics,
                 num_steps=num_steps,
-            )  # Returns (1, C, T, H, W)
+            )  # Returns (video, kinematic_predictions)
 
             # Extract only the actual generated frames (remove padding)
             chunk_video = chunk_video[:, :, :actual_chunk_size, :, :]
@@ -839,6 +1140,28 @@ class Video2WorldInference:
             else:
                 # Remove overlap frames from the beginning
                 generated_chunks.append(chunk_video[:, :, chunk_overlap:, :, :])
+
+            # Extract and upsample kinematic predictions for next chunk
+            if chunk_kinematic_predictions is not None:
+                # Print kinematic predictions for this chunk
+                print(f"\n=== Chunk {chunk_idx + 1} Kinematic Predictions ===")
+                frame_offset = start_frame  # Offset for frame numbering
+                self._print_kinematic_predictions(chunk_kinematic_predictions, frame_offset=frame_offset)
+                # Upsample from latent rate to pixel rate
+                # chunk_kinematic_predictions is at latent rate [B, T_latent, N, 14]
+                # Need to upsample to pixel rate for next chunk conditioning
+                actual_chunk_pixel_frames = actual_chunk_size  # actual_chunk_size is already at pixel rate
+                predicted_kinematics_pixel = self._upsample_kinematics_to_pixel_rate(
+                    chunk_kinematic_predictions,
+                    T_pixel_target=actual_chunk_pixel_frames,
+                )
+                log.info(
+                    f"Chunk {chunk_idx + 1}: Extracted kinematic predictions "
+                    f"(latent: {chunk_kinematic_predictions['position'].shape[1]}, "
+                    f"pixel: {predicted_kinematics_pixel.shape[1]})"
+                )
+            else:
+                predicted_kinematics_pixel = None
 
             # Update input for next iteration using generated frames
             if chunk_idx < num_chunks - 1:

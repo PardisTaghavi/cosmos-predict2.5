@@ -314,6 +314,7 @@ class CommonInferenceArguments(pydantic.BaseModel):
     def validate_prompt(cls, data: Any) -> Any:
         """
         Sets the 'prompt' field using the content of 'prompt_path' if it's provided.
+        Supports both .txt files (text) and .json files (JSON caption format).
         """
         if not isinstance(data, dict):
             return data
@@ -324,7 +325,46 @@ class CommonInferenceArguments(pydantic.BaseModel):
         if prompt_path is not None:
             # pyrefly: ignore  # annotation-mismatch
             prompt_path: Path = ResolvedFilePath(prompt_path)
-            data["prompt"] = prompt_path.read_text().strip()
+            
+            # Check if it's a JSON file
+            if prompt_path.suffix.lower() == ".json":
+                # Load JSON caption similar to VideoDataset._load_json_caption
+                try:
+                    with open(prompt_path, "r") as f:
+                        json_data = json.load(f)
+                    
+                    # Check if it's the new format with "captions" array
+                    if "captions" in json_data and isinstance(json_data["captions"], list):
+                        captions = json_data["captions"]
+                        valid_captions = [cap.strip() for cap in captions if cap.strip()]
+                        if valid_captions:
+                            data["prompt"] = "\n\n".join(valid_captions)
+                            return data
+                    
+                    # Fallback: old format (for backward compatibility)
+                    if isinstance(json_data, dict) and json_data:
+                        # Get the first model's captions (e.g., "qwen3_vl_30b_a3b")
+                        model_key = next(iter(json_data.keys()))
+                        captions = json_data[model_key]
+                        
+                        # Use first available prompt type (or "long" if available)
+                        if isinstance(captions, dict):
+                            if "long" in captions:
+                                data["prompt"] = captions["long"]
+                            elif "short" in captions:
+                                data["prompt"] = captions["short"]
+                            elif "medium" in captions:
+                                data["prompt"] = captions["medium"]
+                            else:
+                                # Use first available
+                                first_prompt = next(iter(captions.values()))
+                                data["prompt"] = first_prompt
+                            return data
+                except Exception as e:
+                    raise ValueError(f"Failed to read JSON caption file {prompt_path}: {e}")
+            else:
+                # Text file format (existing behavior)
+                data["prompt"] = prompt_path.read_text().strip()
             return data
         return data
 
@@ -450,6 +490,11 @@ class InferenceArguments(CommonInferenceArguments):
         default=1, description="Number of overlapping frames between consecutive chunks"
     )
     """Number of overlapping frames between consecutive chunks for temporal consistency. Default to 1 meaning image to video generation for the following chunk."""
+
+    # Kinematic conditioning
+    kinematics_path: ResolvedFilePath | None = None
+    """Optional path to .h5 or .npy file containing kinematic data for conditioning. 
+    Kinematics should be at pixel frame rate [T, N, 18] where T matches num_output_frames."""
 
     # Override defaults
     # pyrefly: ignore  # bad-override

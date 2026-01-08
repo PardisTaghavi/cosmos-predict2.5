@@ -18,6 +18,7 @@
 import json
 import os
 import random
+import h5py
 import traceback
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -30,7 +31,6 @@ from torch.utils.data import DataLoader, Dataset, DistributedSampler
 from torchvision import transforms as T
 
 from cosmos_predict2._src.imaginaire.lazy_config import LazyCall as L
-from cosmos_predict2._src.imaginaire.utils import log
 from cosmos_predict2._src.predict2.datasets.local_datasets.dataset_utils import ResizePreprocess, ToTensorVideo
 
 
@@ -70,13 +70,33 @@ class VideoDataset(Dataset):
         self._setup_caption_format()
 
         video_dir = os.path.join(self.dataset_dir, "videos")
+        self.kinematics_dir = os.path.join(self.dataset_dir, "kinematics")
+
 
         if video_paths is None:
             self.video_paths = [os.path.join(video_dir, f) for f in os.listdir(video_dir) if f.endswith(".mp4")]
             self.video_paths = sorted(self.video_paths)
         else:
             self.video_paths = video_paths
-        log.info(f"{len(self.video_paths)} videos in total")
+        print(f"[VideoDataset] {len(self.video_paths)} videos in total")
+        
+        # Verify kinematics directory exists
+        if not os.path.exists(self.kinematics_dir):
+            raise FileNotFoundError(
+                f"Kinematics directory not found: {self.kinematics_dir}\n"
+                f"Expected structure:\n"
+                f"  {self.dataset_dir}/\n"
+                f"    ├── videos/\n"
+                f"    ├── metas/\n"
+                f"    └── kinematics/  ← MISSING\n"
+                f"\nPlease ensure your dataset has a 'kinematics' subdirectory with .h5 files."
+            )
+        
+        # Count available kinematics files
+        kin_files = [f for f in os.listdir(self.kinematics_dir) if f.endswith('.h5')]
+        print(f"[VideoDataset] {len(kin_files)} kinematic files found in {self.kinematics_dir}")
+        if len(kin_files) == 0:
+            print(f"[VideoDataset] WARNING: No .h5 kinematics files found in {self.kinematics_dir}")
 
         self.num_failed_loads = 0
         self.preprocess = T.Compose([ToTensorVideo(), ResizePreprocess((video_size[0], video_size[1]))])
@@ -87,7 +107,7 @@ class VideoDataset(Dataset):
     def __len__(self) -> int:
         return len(self.video_paths)
 
-    def _load_video(self, video_path: str) -> tuple[np.ndarray, float]:
+    def _load_video(self, video_path: str) -> tuple[np.ndarray, float, int]:
         vr = VideoReader(video_path, ctx=cpu(0), num_threads=2)
         total_frames = len(vr)
         if total_frames < self.sequence_length:
@@ -98,7 +118,11 @@ class VideoDataset(Dataset):
 
         # randomly sample a sequence of frames
         max_start_idx = total_frames - self.sequence_length
-        start_frame = np.random.randint(0, max_start_idx)
+        if max_start_idx > 0:
+            start_frame = np.random.randint(0, max_start_idx)
+        else:
+            # Video has exactly sequence_length frames, use all of them
+            start_frame = 0
         end_frame = start_frame + self.sequence_length
         frame_ids = np.arange(start_frame, end_frame).tolist()
 
@@ -110,7 +134,7 @@ class VideoDataset(Dataset):
         except Exception:  # failed to read FPS, assume it is 16
             fps = 16
         del vr  # delete the reader to avoid memory leak
-        return frame_data, fps
+        return frame_data, fps, start_frame
 
     def _setup_caption_format(self) -> None:
         """Determine the caption format and set up the caption directory."""
@@ -145,21 +169,31 @@ class VideoDataset(Dataset):
         try:
             return text_source.read_text().strip()
         except Exception as e:
-            log.warning(f"Failed to read caption file {text_source}: {e}")
+            print(f"[VideoDataset] WARNING: Failed to read caption file {text_source}: {e}")
             return ""
 
     def _load_json_caption(self, json_path: Path) -> str:
-        """Load caption from JSON file with prompt type selection."""
+        """Load caption from JSON file, concatenating all clip captions for full video."""
         try:
             with open(json_path, "r") as f:
-                content = f.read()
-                # Handle JSON that might not have top-level object
-                if not content.strip().startswith("{"):
-                    # Wrap in object if needed
-                    data = json.loads("{" + content + "}")
-                else:
-                    data = json.loads(content)
-
+                data = json.load(f)
+            
+            # Check if it's the new format with "captions" array (for 5-second clip captions)
+            if "captions" in data and isinstance(data["captions"], list):
+                # Concatenate all captions for the full 20-second video
+                captions = data["captions"]
+                # Filter out empty captions and join with separator
+                valid_captions = [cap.strip() for cap in captions if cap.strip()]
+                if valid_captions:
+                    # Join with double newline to separate clip descriptions
+                    return "\n\n".join(valid_captions)
+                return ""
+            
+            # Fallback: old format (for backward compatibility)
+            # Handle JSON that might not have top-level object
+            if not isinstance(data, dict) or not data:
+                return ""
+            
             # Get the first model's captions (e.g., "qwen3_vl_30b_a3b")
             model_key = next(iter(data.keys()))
             captions = data[model_key]
@@ -169,8 +203,8 @@ class VideoDataset(Dataset):
                 if self.prompt_type in captions:
                     return captions[self.prompt_type]
                 else:
-                    log.warning(
-                        f"Prompt type '{self.prompt_type}' not found in {json_path}. "
+                    print(
+                        f"[VideoDataset] WARNING: Prompt type '{self.prompt_type}' not found in {json_path}. "
                         f"Available: {list(captions.keys())}. Using first available."
                     )
 
@@ -179,21 +213,53 @@ class VideoDataset(Dataset):
             return first_prompt
 
         except Exception as e:
-            log.warning(f"Failed to read JSON caption file {json_path}: {e}")
+            print(f"[VideoDataset] WARNING: Failed to read JSON caption file {json_path}: {e}")
             return ""
 
-    def _get_frames(self, video_path: str) -> tuple[torch.Tensor, float]:
-        frames, fps = self._load_video(video_path)
+    def _get_frames(self, video_path: str) -> tuple[torch.Tensor, float, int]:
+        frames, fps, start_frame = self._load_video(video_path)
         frames = frames.astype(np.uint8)
         frames = torch.from_numpy(frames).permute(0, 3, 1, 2)  # [T, C, H, W]
         frames = self.preprocess(frames)
         frames = torch.clamp(frames * 255.0, 0, 255).to(torch.uint8)
-        return frames, fps
-
+        return frames, fps, start_frame
+    
+    def _load_kinematics(self, video_basename: str, start_frame: int) -> torch.Tensor:
+        """Load kinematics from .h5 file at full pixel frame rate.
+        
+        Kinematics are loaded at pixel frame rate (same as video frames).
+        Temporal windowing and downsampling to match VAE compression is handled
+        by the KinematicConditioner module, which processes frames in windows
+        matching the VAE's temporal compression pattern.
+        """
+        kinematics_path = os.path.join(self.kinematics_dir, f"{video_basename}.h5")
+        
+        if not os.path.exists(kinematics_path):
+            raise FileNotFoundError(
+                f"Kinematics file not found: {kinematics_path}\n"
+                f"Expected kinematics_dir: {self.kinematics_dir}\n"
+                f"Video basename: {video_basename}"
+            )
+        
+        with h5py.File(kinematics_path, 'r') as f:
+            # Load kinematics data: shape (T, num_objects, features)
+            if 'frames' not in f:
+                raise KeyError(f"'frames' dataset not found in {kinematics_path}. Available keys: {list(f.keys())}")
+            
+            kin_data = f['frames'][:]
+            
+            # Sample same temporal range as video for alignment
+            # Load at full pixel frame rate - temporal windowing handled by conditioner
+            end_frame = start_frame + self.sequence_length
+            kin_full = kin_data[start_frame:end_frame]  # [T_pixel, N, D]
+            
+            return torch.from_numpy(kin_full).float()
+                
+        
     def __getitem__(self, index: int) -> dict | Any:
         try:
             data = dict()
-            video, fps = self._get_frames(self.video_paths[index])
+            video, fps, start_frame = self._get_frames(self.video_paths[index])
             video = video.permute(1, 0, 2, 3)  # Rearrange from [T, C, H, W] to [C, T, H, W]
 
             # Load caption based on format
@@ -210,6 +276,11 @@ class VideoDataset(Dataset):
             data["video"] = video
             data["ai_caption"] = caption
 
+            # Load kinematics with same temporal range as video
+            kinematics = self._load_kinematics(video_basename, start_frame)
+            data["kinematics"] = kinematics  # (T, num_objects, features)
+
+
             _, _, h, w = video.shape
 
             data["fps"] = fps
@@ -220,10 +291,10 @@ class VideoDataset(Dataset):
             return data
         except Exception as e:
             self.num_failed_loads += 1
-            log.warning(
-                f"Failed to load video {self.video_paths[index]} (total failures: {self.num_failed_loads}): {e}\n"
-                f"{traceback.format_exc()}",
-                rank0_only=False,
+            print(
+                f"[VideoDataset] WARNING: Failed to load video {self.video_paths[index]} "
+                f"(total failures: {self.num_failed_loads}): {e}\n"
+                f"{traceback.format_exc()}"
             )
             # Randomly sample another video
             return self[np.random.randint(len(self.video_paths))]
@@ -288,7 +359,7 @@ def get_train_val_dataloaders(
 ):
     video_dir = os.path.join(dataset_path, "videos")
     if not os.path.exists(video_dir):
-        log.debug(f"Dataset path {dataset_path} does not exist, returning empty dataloaders")
+        print(f"[VideoDataset] Dataset path {dataset_path} does not exist, returning empty dataloaders")
         return dict(), dict()
     video_paths = [os.path.join(video_dir, f) for f in os.listdir(video_dir) if f.endswith(".mp4")]
     random.seed(seed)

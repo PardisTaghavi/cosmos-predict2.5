@@ -12,9 +12,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
+import psutil
+import pynvml
 import torch
 
 from cosmos_predict2._src.imaginaire.auxiliary.guardrail.common import presets as guardrail_presets
@@ -24,6 +28,106 @@ from cosmos_predict2._src.imaginaire.utils import distributed, log
 from cosmos_predict2._src.imaginaire.visualize.video import save_img_or_video
 from cosmos_predict2._src.predict2.inference.video2world import Video2WorldInference
 from cosmos_predict2.config import InferenceArguments, SetupArguments, path_to_str
+
+
+def get_gpu_stats() -> dict[str, float]:
+    """Collect GPU and CPU statistics similar to DeviceMonitor callback."""
+    stats = {}
+    
+    # CPU memory
+    try:
+        cur_process = psutil.Process(os.getpid())
+        cpu_memory_usage = sum(p.memory_info().rss for p in [cur_process] + cur_process.children(recursive=True))
+        stats["cpu_mem_gb"] = cpu_memory_usage / (1024**3)
+    except Exception:
+        stats["cpu_mem_gb"] = 0.0
+    
+    if torch.cuda.is_available():
+        # GPU memory stats
+        stats["peak_gpu_mem_gb"] = torch.cuda.max_memory_allocated() / (1024**3)
+        stats["peak_gpu_mem_reserved_gb"] = torch.cuda.max_memory_reserved() / (1024**3)
+        
+        # GPU temperature, power, utilization, clock
+        try:
+            stats["temp"] = torch.cuda.temperature()
+        except Exception:
+            stats["temp"] = 0.0
+        
+        try:
+            stats["power"] = torch.cuda.power_draw()
+        except Exception:
+            stats["power"] = 0.0
+        
+        try:
+            stats["util"] = torch.cuda.utilization()
+        except Exception:
+            stats["util"] = 0.0
+        
+        try:
+            stats["clock"] = torch.cuda.clock_rate()
+        except Exception:
+            stats["clock"] = 0.0
+        
+        # NVML stats
+        try:
+            pynvml.nvmlInit()
+            local_rank = int(os.environ.get("LOCAL_RANK", 0))
+            handle = pynvml.nvmlDeviceGetHandleByIndex(local_rank)
+            memory_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            stats["nvml_used_gpu_mem_gb"] = memory_info.used / (1024**3)
+            stats["nvml_free_gpu_mem_gb"] = memory_info.free / (1024**3)
+        except Exception:
+            stats["nvml_used_gpu_mem_gb"] = 0.0
+            stats["nvml_free_gpu_mem_gb"] = 0.0
+    else:
+        # Set defaults if CUDA not available
+        stats.update({
+            "peak_gpu_mem_gb": 0.0,
+            "peak_gpu_mem_reserved_gb": 0.0,
+            "temp": 0.0,
+            "power": 0.0,
+            "util": 0.0,
+            "clock": 0.0,
+            "nvml_used_gpu_mem_gb": 0.0,
+            "nvml_free_gpu_mem_gb": 0.0,
+        })
+    
+    return stats
+
+
+def print_gpu_stats_summary(stats: dict[str, float], label: str = "Inference"):
+    """Print GPU stats in a formatted table similar to training output."""
+    if not torch.cuda.is_available():
+        log.info(f"{label} GPU Stats: CUDA not available")
+        return
+    
+    # Create summary DataFrame with same format as training (Avg/Max/Min columns)
+    metric_order = [
+        "cpu_mem_gb",
+        "peak_gpu_mem_gb",
+        "peak_gpu_mem_reserved_gb",
+        "nvml_used_gpu_mem_gb",
+        "nvml_free_gpu_mem_gb",
+        "temp",
+        "power",
+        "util",
+        "clock",
+    ]
+    
+    summary_data = {"Avg": [], "Max": [], "Min": []}
+    metric_names = []
+    
+    for metric in metric_order:
+        if metric in stats:
+            value = stats[metric]
+            summary_data["Avg"].append(value)
+            summary_data["Max"].append(value)
+            summary_data["Min"].append(value)
+            metric_names.append(metric)
+    
+    if metric_names:
+        df = pd.DataFrame(summary_data, index=metric_names)
+        log.info(f"{label} GPU Stats:\n{df.to_string()}")
 
 
 class Inference:
@@ -111,11 +215,15 @@ class Inference:
             elif self.text_guardrail_runner is None:
                 log.warning("Guardrail checks on prompt are disabled")
 
+        # Reset peak memory stats before generation
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+
         # Choose generation mode based on autoregressive flag
         video: torch.Tensor
         if sample.enable_autoregressive:
             log.info(f"Generating video with autoregressive mode...")
-            video = self.pipe.generate_autoregressive_from_batch(
+            result = self.pipe.generate_autoregressive_from_batch(
                 prompt=sample.prompt,
                 input_path=path_to_str(sample.input_path),
                 num_output_frames=sample.num_output_frames,
@@ -126,11 +234,14 @@ class Inference:
                 resolution=sample.resolution,
                 seed=sample.seed,
                 negative_prompt=sample.negative_prompt,
+                kinematics_path=path_to_str(sample.kinematics_path) if sample.kinematics_path else None,
                 num_steps=sample.num_steps,
             )
+            # Handle return value: autoregressive returns video only
+            video = result
         else:
             log.info(f"Generating video with standard mode...")
-            video = self.pipe.generate_vid2world(
+            result = self.pipe.generate_vid2world(
                 prompt=sample.prompt,
                 input_path=path_to_str(sample.input_path),
                 guidance=sample.guidance,
@@ -139,8 +250,19 @@ class Inference:
                 resolution=sample.resolution,
                 seed=sample.seed,
                 negative_prompt=sample.negative_prompt,
+                kinematics_path=path_to_str(sample.kinematics_path) if sample.kinematics_path else None,
                 num_steps=sample.num_steps,
             )
+            # Handle return value: could be (video,) or (video, kinematic_predictions)
+            if isinstance(result, tuple):
+                video = result[0]
+            else:
+                video = result
+        
+        # Print GPU stats after generation
+        if self.rank0:
+            stats = get_gpu_stats()
+            print_gpu_stats_summary(stats, label=f"Inference [{sample.name}]")
 
         if self.rank0:
             video = (1.0 + video[0]) / 2
@@ -166,6 +288,6 @@ class Inference:
             else:
                 log.warning("Guardrail checks on video are disabled")
 
-            save_img_or_video(video, str(output_path), fps=16)
+            save_img_or_video(video, str(output_path), fps=2)
             log.success(f"Saved video to {output_path}.mp4")
         return f"{output_path}.mp4"

@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import collections
 import math
 from collections import namedtuple
@@ -1615,6 +1616,12 @@ class MiniTrainDIT(WeightTrainingStat):
             in_channels=in_channels,
             out_channels=model_channels,
         )
+        
+        # Kinematic conditioning (optional, only used if kinematics are provided)
+        # These are created conditionally in _setup_kinematic_modules() to avoid breaking original checkpoints
+        self.kinematic_conditioner = None  # Will be set externally if needed
+        self.kin_scale = None  # Will be created conditionally if kinematic_loss_weight > 0
+        self.kinematic_head = None  # Will be set externally if needed
 
     def build_pos_embed(self):
         if self.pos_emb_cls == "rope3d":
@@ -1720,12 +1727,14 @@ class MiniTrainDIT(WeightTrainingStat):
         data_type: Optional[DataType] = DataType.VIDEO,
         intermediate_feature_ids: Optional[List[int]] = None,
         img_context_emb: Optional[torch.Tensor] = None,
+        kinematics: Optional[torch.Tensor] = None,
     ) -> torch.Tensor | List[torch.Tensor] | Tuple[torch.Tensor, List[torch.Tensor]]:
         """
         Args:
             x: (B, C, T, H, W) tensor of spatial-temp inputs
             timesteps: (B, ) tensor of timesteps
             crossattn_emb: (B, N, D) tensor of cross-attention embeddings
+            kinematics: (B, T, N, 13) tensor of kinematic data (optional)
         """
         assert isinstance(data_type, DataType), (
             f"Expected DataType, got {type(data_type)}. We need discuss this flag later."
@@ -1735,6 +1744,73 @@ class MiniTrainDIT(WeightTrainingStat):
             fps=fps,
             padding_mask=padding_mask,
         )
+
+        # Apply kinematic conditioning (optional - required during training, optional during inference)
+        # Get spatial shape from embedded tokens
+        B, T, H, W, D = x_B_T_H_W_D.shape
+        
+        if kinematics is not None:
+            # Kinematics provided - apply conditioning
+            # Check if kinematic modules exist (they may not exist for original Cosmos checkpoints)
+            if not hasattr(self, 'kinematic_conditioner') or self.kinematic_conditioner is None:
+                raise RuntimeError(
+                    "Kinematics provided but kinematic_conditioner is not initialized. "
+                    "This model was loaded from an original Cosmos checkpoint without kinematic modules. "
+                    "To use kinematic conditioning, either:\n"
+                    "1. Train a new checkpoint with kinematic_loss_weight > 0, or\n"
+                    "2. Do not provide kinematics_path in inference config for zero-shot inference."
+                )
+            
+            # Kinematics are at pixel frame rate - conditioner handles temporal windowing internally
+            # Verify kinematics compress to expected latent temporal dimension
+            # VAE formula: T_latent = 1 + (T_pixel - 1) // 4
+            # Multiple T_pixel values can map to same T_latent (e.g., T_pixel 37-40 all map to T_latent=10)
+            B_kin, T_kin_pixel, N_kin, D_kin = kinematics.shape
+            T_latent_expected = T  # Model's T is already at latent rate (after VAE compression)
+            T_latent_from_kinematics = 1 + (T_kin_pixel - 1) // 4  # Apply VAE compression formula
+            
+            assert T_latent_from_kinematics == T_latent_expected, (
+                f"Temporal dimension mismatch: kinematics T_pixel={T_kin_pixel} compresses to T_latent={T_latent_from_kinematics}, "
+                f"but model expects T_latent={T_latent_expected}. "
+                f"Kinematics must compress to match model's latent temporal dimension. "
+                f"Valid T_pixel range for T_latent={T_latent_expected} is [{(T_latent_expected - 1) * 4 + 1}, {T_latent_expected * 4}]. "
+                f"Got T_kin_pixel={T_kin_pixel}."
+            )
+            
+            # Get kinematic conditioning: conditioner handles temporal windowing internally
+            # Input: [B, T_pixel, N, 18] → Output: [B, T_latent*H*W, D]
+            tau_kin = self.kinematic_conditioner(
+                kinematics_B_T_N_D=kinematics,
+                spatial_shape=(H, W)
+            )
+            
+            # Verify conditioner output matches expected latent temporal dimension
+            # tau_kin should be [B, T_latent*H*W, D] where T_latent matches model's T
+            # Note: T_latent may differ from formula due to VAE's remainder handling
+            tau_kin_THW, tau_kin_D = tau_kin.shape[1], tau_kin.shape[2]
+            tau_kin_T = tau_kin_THW // (H * W)
+            assert tau_kin_T == T, (
+                f"Conditioner output temporal mismatch: expected T={T} but got T={tau_kin_T} "
+                f"from conditioner output shape {tau_kin.shape}. "
+                f"Conditioner should output [B, T*H*W, D] where T matches model's latent temporal dimension. "
+                f"Input kinematics T_pixel={T_kin_pixel} should compress to T_latent={T}."
+            )
+            
+            # Reshape to match x_B_T_H_W_D: [B, T*H*W, D] -> [B, T, H, W, D]
+            tau_kin = rearrange(tau_kin, "b (t h w) d -> b t h w d", t=T, h=H, w=W)
+            
+            # Add kinematic conditioning with learnable scaling
+            # kin_scale should exist if kinematic_conditioner exists (created together in _setup_kinematic_modules)
+            if self.kin_scale is None:
+                raise RuntimeError(
+                    "kin_scale parameter is None but kinematic_conditioner exists. "
+                    "This indicates inconsistent kinematic module initialization. "
+                    "kin_scale should be created in _setup_kinematic_modules()."
+                )
+            x_B_T_H_W_D = x_B_T_H_W_D + self.kin_scale * tau_kin
+        # else: kinematics is None - skip conditioning (e.g., during inference without kinematics)
+
+        
 
         if self.use_crossattn_projection:
             crossattn_emb = self.crossattn_proj(crossattn_emb)
@@ -1787,6 +1863,18 @@ class MiniTrainDIT(WeightTrainingStat):
         # O = out_channels * spatial_patch_size * spatial_patch_size * temporal_patch_size
         x_B_T_H_W_O = self.final_layer(x_B_T_H_W_D, t_embedding_B_T_D, adaln_lora_B_T_3D=adaln_lora_B_T_3D)
         x_B_C_Tt_Hp_Wp = self.unpatchify(x_B_T_H_W_O)
+        
+        # Predict kinematics (optional - only if kinematic_head exists)
+        # Original Cosmos checkpoints don't have kinematic_head, so this is optional
+        if hasattr(self, 'kinematic_head') and self.kinematic_head is not None:
+            # Use the last layer features before final projection for kinematic prediction
+            # Reshape to [B, T*H*W, D] for the kinematic head
+            features_for_kin = rearrange(x_B_T_H_W_D, "b t h w d -> b (t h w) d")
+            kinematic_predictions = self.kinematic_head(features_for_kin, spatial_shape=(H, W))
+        else:
+            # Original Cosmos checkpoint - no kinematic prediction head
+            kinematic_predictions = None
+        
         if intermediate_feature_ids:
             if len(intermediate_features_outputs) != len(intermediate_feature_ids):
                 log.warning(
@@ -1794,9 +1882,9 @@ class MiniTrainDIT(WeightTrainingStat):
                     f"but expected {len(intermediate_feature_ids)}. "
                     f"Requested IDs: {intermediate_feature_ids}"
                 )
-            return x_B_C_Tt_Hp_Wp, intermediate_features_outputs
-
-        return x_B_C_Tt_Hp_Wp
+            return x_B_C_Tt_Hp_Wp, intermediate_features_outputs, kinematic_predictions
+        
+        return x_B_C_Tt_Hp_Wp, kinematic_predictions
 
     def enable_selective_checkpoint(self, sac_config: SACConfig, blocks: nn.ModuleList):
         if sac_config.mode == CheckpointMode.NONE:

@@ -203,6 +203,18 @@ def load_model_state_dict_from_checkpoint(
     if s3_checkpoint_dir is not None:
         s3_checkpoint_dir = str(s3_checkpoint_dir)
     checkpoint_format = "pt" if s3_checkpoint_dir.endswith(".pt") else "dcp"
+    
+    # Debug print for LoRA configuration
+    if hasattr(model, "config") and hasattr(model.config, "use_lora"):
+        use_lora = model.config.use_lora
+        print(f"[LoRA Setup] use_lora={use_lora}, checkpoint_format={checkpoint_format}")
+        if use_lora:
+            print(f"[LoRA Setup] LoRA enabled with rank={model.config.lora_rank}, alpha={model.config.lora_alpha}")
+            print(f"[LoRA Setup] Target modules: {model.config.lora_target_modules}")
+        else:
+            print("[LoRA Setup] LoRA is disabled - loading standard checkpoint")
+    else:
+        print("[LoRA Setup] Model config does not have use_lora attribute")
     if s3_checkpoint_dir.startswith("s3:"):
         if checkpoint_format == "pt":
             cur_key_ckpt_full_path = s3_checkpoint_dir

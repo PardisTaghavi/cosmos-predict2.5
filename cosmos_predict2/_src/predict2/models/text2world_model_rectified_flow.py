@@ -1353,20 +1353,20 @@ class Text2WorldModelRectifiedFlow(ImaginaireModel):
 
         state_dict = _reg_state_dict
 
-        # Always use strict mode to ensure code and weights correspond correctly
-        # This ensures that missing kinematic modules in original checkpoints will raise errors
-        # rather than silently using randomly initialized modules
-        reg_results: _IncompatibleKeys = self.net.load_state_dict(_reg_state_dict, strict=True, assign=assign)
+        # Always load state dict, respecting the strict parameter
+        reg_results: _IncompatibleKeys = self.net.load_state_dict(_reg_state_dict, strict=strict, assign=assign)
 
+        # Load EMA weights if enabled, using the same strict setting
+        ema_results = None
         if self.config.ema.enabled:
             ema_results: _IncompatibleKeys = self.net_ema.load_state_dict(
-                _ema_state_dict, strict=True, assign=assign
+                _ema_state_dict, strict=strict, assign=assign
             )
 
         return _IncompatibleKeys(
-            missing_keys=reg_results.missing_keys + (ema_results.missing_keys if self.config.ema.enabled else []),
+            missing_keys=reg_results.missing_keys + (ema_results.missing_keys if ema_results else []),
             unexpected_keys=reg_results.unexpected_keys
-            + (ema_results.unexpected_keys if self.config.ema.enabled else []),
+            + (ema_results.unexpected_keys if ema_results else []),
         )
 
     # ------------------ public methods ------------------

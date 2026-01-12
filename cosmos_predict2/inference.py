@@ -154,6 +154,7 @@ class Inference:
             offload_diffusion_model=args.offload_diffusion_model,
             offload_text_encoder=args.offload_text_encoder,
             offload_tokenizer=args.offload_tokenizer,
+            quantize_8bit=args.quantize_8bit,
         )
         if self.rank0:
             args.output_dir.mkdir(parents=True, exist_ok=True)

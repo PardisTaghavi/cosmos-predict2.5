@@ -18,6 +18,7 @@ from typing import Any, List
 
 import attrs
 
+
 from cosmos_predict2._src.imaginaire import config
 from cosmos_predict2._src.imaginaire.trainer import ImaginaireTrainer as Trainer
 from cosmos_predict2._src.imaginaire.utils.config_helper import import_all_modules_from_package

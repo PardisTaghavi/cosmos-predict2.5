@@ -252,6 +252,7 @@ class Video2WorldInference:
         offload_diffusion_model: bool = False,
         offload_text_encoder: bool = False,
         offload_tokenizer: bool = False,
+        quantize_8bit: bool = False,
     ):
         """
         Initializes the Video2WorldInference class.
@@ -264,6 +265,7 @@ class Video2WorldInference:
             ckpt_path (str): Path to the model checkpoint (local or S3).
             s3_credential_path (str): Path to S3 credentials file (if loading from S3).
             context_parallel_size (int): Number of GPUs for context parallelism.
+            quantize_8bit (bool): Whether to quantize DiT network to 8-bit.
         """
         self.experiment_name = experiment_name
         self.ckpt_path = ckpt_path
@@ -274,6 +276,7 @@ class Video2WorldInference:
         self.offload_diffusion_model = offload_diffusion_model
         self.offload_text_encoder = offload_text_encoder
         self.offload_tokenizer = offload_tokenizer
+        self.quantize_8bit = quantize_8bit
 
         # If no offloading is specified, instruct model loader to move the model to GPU
         model_device = None if offload_diffusion_model else "cuda"
@@ -314,6 +317,12 @@ class Video2WorldInference:
         else:
             # Move everything to the GPU (marginal overhead)
             model.net.to("cuda")
+
+        # [Quantization]: Apply 8-bit quantization to DiT network if requested
+        if self.quantize_8bit:
+            log.info("[Memory Optimization] Applying 8-bit quantization to DiT network")
+            model.net = self._quantize_dit_network(model.net)
+            log.info("[Memory Optimization] DiT network quantized to 8-bit")
 
         # [On-entry offloading part 2]: Tokenizer
         if self.offload_tokenizer:
@@ -356,6 +365,83 @@ class Video2WorldInference:
         self.config = config
         self.batch_size = 1
         self.neg_t5_embeddings = None
+
+    def _quantize_dit_network(self, dit_network):
+        """
+        Apply 8-bit quantization to the DiT network using BitsAndBytes.
+        
+        Args:
+            dit_network: The DiT network to quantize
+            
+        Returns:
+            Quantized DiT network
+        """
+        try:
+            import torch
+            from torch import nn
+            
+            # Import bitsandbytes
+            try:
+                import bitsandbytes as bnb
+            except ImportError:
+                log.error("BitsAndBytes not installed. Install with: pip install bitsandbytes")
+                log.error("Continuing without quantization...")
+                return dit_network
+            
+            # Get device
+            device = next(dit_network.parameters()).device
+            dtype = next(dit_network.parameters()).dtype
+            
+            # Move to CPU for quantization if on GPU
+            was_on_gpu = device.type == "cuda"
+            if was_on_gpu:
+                dit_network = dit_network.to("cpu")
+            
+            # Quantize all Linear layers in the DiT network
+            def quantize_linear_layers(module):
+                for name, child in module.named_children():
+                    if isinstance(child, nn.Linear):
+                        # Get layer parameters
+                        in_features = child.in_features
+                        out_features = child.out_features
+                        bias = child.bias is not None
+                        
+                        # Create 8-bit linear layer
+                        quantized_layer = bnb.nn.Linear8bitLt(
+                            in_features,
+                            out_features,
+                            bias=bias,
+                            has_fp16_weights=False,
+                            threshold=6.0,
+                        )
+                        
+                        # Copy weights
+                        with torch.no_grad():
+                            quantized_layer.weight.data = child.weight.data.clone()
+                            if bias:
+                                quantized_layer.bias.data = child.bias.data.clone()
+                        
+                        # Replace the layer
+                        setattr(module, name, quantized_layer)
+                        log.debug(f"Quantized layer: {name} ({in_features} -> {out_features})")
+                    else:
+                        # Recursively quantize child modules
+                        quantize_linear_layers(child)
+            
+            log.info("Quantizing Linear layers in DiT network...")
+            quantize_linear_layers(dit_network)
+            
+            # Move back to original device
+            if was_on_gpu:
+                dit_network = dit_network.to("cuda")
+            
+            log.info("DiT network quantization complete")
+            return dit_network
+            
+        except Exception as e:
+            log.error(f"Error during quantization: {e}")
+            log.error("Continuing without quantization...")
+            return dit_network
 
     def _init_distributed(self):
         """Initialize distributed processing for context parallelism."""
@@ -411,7 +497,7 @@ class Video2WorldInference:
             "video": video,
             "camera": camera,
             "action": action.unsqueeze(0) if action is not None else None,
-            "fps": torch.randint(16, 32, (self.batch_size,)).float(),  # Random FPS (might be used by model)
+            "fps": torch.tensor([2.0] * self.batch_size).float(),  # Set to 2Hz to match input video
             "padding_mask": torch.zeros(self.batch_size, 1, H, W),  # Padding mask (assumed no padding here)
             "num_conditional_frames": num_conditional_frames,  # Specify number of conditional frames
         }

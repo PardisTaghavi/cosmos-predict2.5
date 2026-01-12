@@ -242,6 +242,8 @@ class CommonSetupArguments(pydantic.BaseModel):
     """Offload tokenizer to CPU to save GPU memory. Default to False."""
     offload_text_encoder: bool = False
     """Offload text encoder to CPU to save GPU memory. Default to False."""
+    quantize_8bit: bool = False
+    """Quantize DiT network to 8-bit using BitsAndBytes to save GPU memory. Default to False."""
     disable_guardrails: bool = True if SMOKE else False
     """Disable guardrails if this is set to True."""
     offload_guardrail_models: bool = True

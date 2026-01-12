@@ -70,6 +70,8 @@ def main():
     pt_ema_fp32_path.unlink(missing_ok=True)
     pt_ema_bf16_path = args.output_dir / "model_ema_bf16.pt"
     pt_ema_bf16_path.unlink(missing_ok=True)
+    pt_ema_kin_bf16_path = args.output_dir / "model_ema_kin_bf16.pt"
+    pt_ema_kin_bf16_path.unlink(missing_ok=True)
 
     if args.input_dir.startswith("s3://"):
         input_s3 = args.input_dir.rstrip("/")
@@ -119,7 +121,7 @@ def main():
     torch.save(state_dict_ema_fp32, pt_ema_fp32_path)
     print(f"Saved EMA fp32 weights from '{pt_path}' to '{pt_ema_fp32_path}'")
 
-    # Save EMA weights only in bf16 precision
+    # Save EMA weights only in bf16 precision (LoRA only, no kinematics)
     state_dict_ema_bf16: dict[str, Any] = {}
     for key, value in state_dict_ema_fp32.items():
         if isinstance(value, torch.Tensor) and value.dtype == torch.float32:
@@ -127,6 +129,21 @@ def main():
         state_dict_ema_bf16[key] = value
     torch.save(state_dict_ema_bf16, pt_ema_bf16_path)
     print(f"fp32 -> bf16: '{pt_ema_fp32_path}' to '{pt_ema_bf16_path}'")
+    
+    # Create EMA + kinematic weights in bf16 precision
+    # Copy kinematic weights from net.* since they don't have EMA versions
+    state_dict_ema_kin_bf16: dict[str, Any] = state_dict_ema_bf16.copy()
+    kinematic_count = 0
+    for key, value in state_dict.items():
+        if key.startswith("net.kinematic") or key == "net.kin_scale":
+            # Convert to bf16 if it's a float32 tensor
+            if isinstance(value, torch.Tensor) and value.dtype == torch.float32:
+                value = value.bfloat16()
+            state_dict_ema_kin_bf16[key] = value
+            kinematic_count += 1
+    
+    torch.save(state_dict_ema_kin_bf16, pt_ema_kin_bf16_path)
+    print(f"Added {kinematic_count} kinematic weights to '{pt_ema_kin_bf16_path}'")
 
 
 if __name__ == "__main__":
